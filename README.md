@@ -1,1 +1,2 @@
-# streamlit-demo2
+# galaxy-poster
+Show ML predictions w/ Streamlit
