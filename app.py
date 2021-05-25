@@ -1,310 +1,233 @@
-import json
-import logging
-
 import streamlit as st
-import numpy as np
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
+
+import requests, os
+from gwpy.timeseries import TimeSeries
+from gwosc.locate import get_urls
+from gwosc import datasets
+from gwosc.api import fetch_event_json
+
+from copy import deepcopy
+import base64
+
+# Use the non-interactive Agg backend, which is recommended as a
+# thread-safe backend.
+# See https://matplotlib.org/3.3.2/faq/howto_faq.html#working-with-threads.
 import matplotlib as mpl
-import tensorflow as tf
-import tensorflow_probability as tfp
-from PIL import Image
+mpl.use("agg")
 
-def main(df):
-    st.title('Bayesian Deep Learning for Galaxy Zoo DECaLS')
-    st.subheader('by Mike Walmsley ([@mike\_walmsley\_](https://twitter.com/mike_walmsley_))')
+##############################################################################
+# Workaround for the limited multi-threading support in matplotlib.
+# Per the docs, we will avoid using `matplotlib.pyplot` for figures:
+# https://matplotlib.org/3.3.2/faq/howto_faq.html#how-to-use-matplotlib-in-a-web-application-server.
+# Moreover, we will guard all operations on the figure instances by the
+# class-level lock in the Agg backend.
+##############################################################################
+from matplotlib.backends.backend_agg import RendererAgg
+_lock = RendererAgg.lock
 
-    st.markdown(
-    """
+
+# -- Set page config
+apptitle = 'GW Quickview'
+
+st.set_page_config(page_title=apptitle, page_icon=":eyeglasses:")
+
+# -- Default detector list
+detectorlist = ['H1','L1', 'V1']
+
+# Title the app
+st.title('Gravitational Wave Quickview')
+
+st.markdown("""
+ * Use the menu at left to select data and set plot parameters
+ * Your plots will appear below
+""")
+
+@st.cache(ttl=3600, max_entries=10)   #-- Magic command to cache data
+def load_gw(t0, detector):
+    strain = TimeSeries.fetch_open_data(detector, t0-14, t0+14, cache=False)
+    return strain
+
+st.sidebar.markdown("## Select Data Time and Detector")
+
+# -- Get list of events
+# find_datasets(catalog='GWTC-1-confident',type='events')
+eventlist = datasets.find_datasets(type='events')
+eventlist = [name.split('-')[0] for name in eventlist if name[0:2] == 'GW']
+eventset = set([name for name in eventlist])
+eventlist = list(eventset)
+eventlist.sort()
+
+#-- Set time by GPS or event
+select_event = st.sidebar.selectbox('How do you want to find data?',
+                                    ['By event name', 'By GPS'])
+
+if select_event == 'By GPS':
+    # -- Set a GPS time:        
+    str_t0 = st.sidebar.text_input('GPS Time', '1126259462.4')    # -- GW150914
+    t0 = float(str_t0)
+
+    st.sidebar.markdown("""
+    Example times in the H1 detector:
+    * 1126259462.4    (GW150914) 
+    * 1187008882.4    (GW170817) 
+    * 933200215       (hardware injection)
+    * 1132401286.33   (Koi Fish Glitch) 
+    """)
+
+else:
+    chosen_event = st.sidebar.selectbox('Select Event', eventlist)
+    t0 = datasets.event_gps(chosen_event)
+    detectorlist = list(datasets.event_detectors(chosen_event))
+    detectorlist.sort()
+    st.subheader(chosen_event)
+    st.write('GPS:', t0)
     
-    <br><br/>
-    Galaxy Zoo DECaLS includes deep learning classifications for all galaxies. 
-
-    Our model learns from volunteers and predicts posteriors for every Galaxy Zoo question.
-
-    Explore the predictions using the filters on the left. Do you agree with the model?
-
-    To read more about how the model works, click below.
-
-    """
-    , unsafe_allow_html=True)
-    should_tell_me_more = st.button('Tell me more')
-    if should_tell_me_more:
-        tell_me_more()
-        st.markdown('---')
-    else:
-        st.markdown('---')
-        interactive_galaxies(df)
-    # st.markdown('The classifier does not see color')
-
-    # header = 'some galaxy'
-    # description = 'this is a galaxy'
-    # image = np.array(Image.open('/media/walml/beta/decals/png_native/dr5/J000/J000000.80+004200.0.png'))
-
-    # st.subheader(header)
-    # st.markdown(description)
-    # st.image(image.astype(np.uint8), use_column_width=False)
-
-    # selected_tree = st.sidebar.radio(
-    #     label='Smooth or featured?',
-    #     options=['Smooth', 'Featured'],
-    #     index=1)
-
-    # # maybe just skip to featured
-    # if selected_tree == 'Smooth':
-    #     questions = ['how_rounded', 'bulge_shape']
-    # else:
+    # -- Experiment to display masses
+    try:
+        jsoninfo = fetch_event_json(chosen_event)
+        for name, nameinfo in jsoninfo['events'].items():        
+            st.write('Mass 1:', nameinfo['mass_1_source'], 'M$_{\odot}$')
+            st.write('Mass 2:', nameinfo['mass_2_source'], 'M$_{\odot}$')
+            #st.write('Distance:', int(nameinfo['luminosity_distance']), 'Mpc')
+            st.write('Network SNR:', int(nameinfo['network_matched_filter_snr']))
+            eventurl = 'https://gw-osc.org/eventapi/html/event/{}'.format(chosen_event)
+            st.markdown('Event page: {}'.format(eventurl))
+            st.write('\n')
+    except:
+        pass
 
 
-def tell_me_more():
-    st.title('Building the Model')
+    
+#-- Choose detector as H1, L1, or V1
+detector = st.sidebar.selectbox('Detector', detectorlist)
 
-    st.button('Back to galaxies')  # will change state and hence trigger rerun and hence reset should_tell_me_more
+# -- Create sidebar for plot controls
+st.sidebar.markdown('## Set Plot Parameters')
+dtboth = st.sidebar.slider('Time Range (seconds)', 0.1, 8.0, 1.0)  # min, max, default
+dt = dtboth / 2.0
+
+st.sidebar.markdown('#### Whitened and band-passed data')
+whiten = st.sidebar.checkbox('Whiten?', value=True)
+freqrange = st.sidebar.slider('Band-pass frequency range (Hz)', min_value=10, max_value=2000, value=(30,400))
+
+
+# -- Create sidebar for Q-transform controls
+st.sidebar.markdown('#### Q-tranform plot')
+vmax = st.sidebar.slider('Colorbar Max Energy', 10, 500, 25)  # min, max, default
+qcenter = st.sidebar.slider('Q-value', 5, 120, 5)  # min, max, default
+qrange = (int(qcenter*0.8), int(qcenter*1.2))
+
+
+#-- Create a text element and let the reader know the data is loading.
+strain_load_state = st.text('Loading data...this may take a minute')
+try:
+    strain_data = load_gw(t0, detector)
+except:
+    st.text('Data load failed.  Try a different time and detector pair.')
+    st.text('Problems can be reported to gwosc@igwn.org')
+    raise st.ScriptRunner.StopException
+    
+strain_load_state.text('Loading data...done!')
+
+#-- Make a time series plot
+
+cropstart = t0-0.2
+cropend   = t0+0.1
+
+cropstart = t0 - dt
+cropend   = t0 + dt
+
+st.subheader('Raw data')
+center = int(t0)
+strain = deepcopy(strain_data)
+
+with _lock:
+    fig1 = strain.crop(cropstart, cropend).plot()
+    #fig1 = cropped.plot()
+    st.pyplot(fig1, clear_figure=True)
+
+
+# -- Try whitened and band-passed plot
+# -- Whiten and bandpass data
+st.subheader('Whitened and Band-passed Data')
+
+if whiten:
+    white_data = strain.whiten()
+    bp_data = white_data.bandpass(freqrange[0], freqrange[1])
+else:
+    bp_data = strain.bandpass(freqrange[0], freqrange[1])
+
+bp_cropped = bp_data.crop(cropstart, cropend)
+
+with _lock:
+    fig3 = bp_cropped.plot()
+    st.pyplot(fig3, clear_figure=True)
+
+# -- Allow data download
+download = {'Time':bp_cropped.times, 'Strain':bp_cropped.value}
+df = pd.DataFrame(download)
+csv = df.to_csv(index=False)
+b64 = base64.b64encode(csv.encode()).decode()  # some strings <-> bytes conversions necessary here
+href = f'<a href="data:file/csv;base64,{b64}">Download Data as CSV File</a>'
+st.markdown(href, unsafe_allow_html=True)
+
+# -- Notes on whitening
+with st.beta_expander("See notes"):
+    st.markdown("""
+ * Whitening is a process that re-weights a signal, so that all frequency bins have a nearly equal amount of noise. 
+ * A band-pass filter uses both a low frequency cutoff and a high frequency cutoff, and only passes signals in the frequency band between these values.
+
+See also:
+ * [Signal Processing Tutorial](https://share.streamlit.io/jkanner/streamlit-audio/main/app.py)
+""")
+
+
+st.subheader('Q-transform')
+
+hq = strain.q_transform(outseg=(t0-dt, t0+dt), qrange=qrange)
+
+with _lock:
+    fig4 = hq.plot()
+    ax = fig4.gca()
+    fig4.colorbar(label="Normalised energy", vmax=vmax, vmin=0)
+    ax.grid(False)
+    ax.set_yscale('log')
+    ax.set_ylim(bottom=15)
+    st.pyplot(fig4, clear_figure=True)
+
+
+with st.beta_expander("See notes"):
 
     st.markdown("""
-    We require a model which can:
-    - Learn efficiently from volunteer responses of varying (i.e. heteroskedastic) uncertainty
-    - Predict posteriors for those responses on new galaxies, for every question
+A Q-transform plot shows how a signal’s frequency changes with time.
 
-    In [previous work](https://arxiv.org/abs/1905.07424), we modelled volunteer responses as being binomially distributed and trained our model to make maximum likelihood estimates using the loss function:
-    """)
+ * The x-axis shows time
+ * The y-axis shows frequency
 
-    st.latex(
-    """
-    \mathcal{L} = k \log f^w(x) + (N-k) \log(1-f^w(x))
-    """
-    )
-    st.markdown(
-    r"""
-    where, for some target question, k is the number of responses (successes) of some target answer, N is the total number of responses (trials) to all answers, and $f^w(x) = \hat{\rho}$ is the predicted probability of a volunteer giving that answer.
-    """
-    )
-   
-    st.markdown(
-    r"""
-    This binomial assumption, while broadly successful, broke down for galaxies with vote fractions k/N close to 0 or 1, where the Binomial likelihood is extremely sensitive to $f^w(x)$, and for galaxies where the question asked was not appropriate (e.g. predict if a featureless galaxy has a bar). 
-    
-    Instead, in our latest work, the model predicts a distribution 
-    """)
+The color scale shows the amount of “energy” or “signal power” in each time-frequency pixel.
 
-    st.latex(r"""
-    f^w(x) = p(\rho|f^w(x))
-    """)
-    
-    st.markdown(r"""
-    and $\rho$ is then drawn from that distribution.
-    
-    For binary questions, one could use the Beta distribution (being flexible and defined on the unit interval), and predict the Beta distribution parameters $f^w(x) = (\hat{\alpha}, \hat{\beta})$ by minimising
+A parameter called “Q” refers to the quality factor.  A higher quality factor corresponds to a larger number of cycles in each time-frequency pixel.  
 
-    """)
+For gravitational-wave signals, binary black holes are most clear with lower Q values (Q = 5-20), where binary neutron star mergers work better with higher Q values (Q = 80 - 120).
 
-    st.latex(
-    r"""
-        \mathcal{L} = \int Bin(k|\rho, N) Beta(\rho|\alpha, \beta) d\alpha d\beta    
-    """
-    )
-    st.markdown(r"""
+See also:
 
-    where the Binomial and Beta distributions are conjugate and hence this integral can be evaluated analytically.
-
-    In practice, we would like to predict the responses to questions with more than two answers, and hence we replace each distribution with its multivariate counterpart; Beta($\rho|\alpha, \beta$) with Dirichlet($\vec{\rho}|\vec{\alpha})$, and Binomial($k|\rho, N$) with Multinomial($\vec{k}|\vec{\rho}, N$).
-    """)
-    
-    st.latex(r"""
-     \mathcal{L}_q = \int Multi(\vec{k}|\vec{\rho}, N) Dirichlet(\vec{\rho}| \vec{\alpha}) d\vec{\alpha}
-    """)
-    
-    st.markdown(r"""
-    where $\vec{k}, \vec{\rho}$ and $\vec{\alpha}$ are now all vectors with one element per answer. 
-
-    Using this loss function, our model can predict posteriors with excellent calibration.
-
-    For the final GZ DECaLS predictions, I actually use an ensemble of models, and apply active learning - picking the galaxies where the models confidently disagree - to choose the most informative galaxies to label with Galaxy Zoo. Check out the paper for more.
-    
-    """)
-
-    st.button('Back to galaxies', key='back_again')  # will change state and hence trigger rerun and hence reset should_tell_me_more
+ * [GWpy q-transform](https://gwpy.github.io/docs/stable/examples/timeseries/qscan.html)
+ * [Reading Time-frequency plots](https://labcit.ligo.caltech.edu/~jkanner/aapt/web/math.html#tfplot)
+ * [Shourov Chatterji PhD Thesis](https://dspace.mit.edu/handle/1721.1/34388)
+""")
 
 
-def interactive_galaxies(df):
-    questions = {
-        'bar': ['strong', 'weak', 'no'], 
-        'has-spiral-arms': ['yes', 'no'],
-        'spiral-arm-count': ['1', '2', '3', '4'],
-        'spiral-winding': ['tight', 'medium', 'loose'],
-        'merging': ['merger', 'major-disturbance', 'minor-disturbance', 'none']
-    }
-    # could make merging yes/no
-
-    # st.sidebar.markdown('# Show posteriors')
-    # show_posteriors = st.sidebar.selectbox('Posteriors for which question?', ['none'] + list(questions.keys()), format_func=lambda x: x.replace('-', ' ').capitalize())
-
-    st.sidebar.markdown('# Choose Your Galaxies')
-    # st.sidebar.markdown('---')
-    current_selection = {}
-    for question, answers in questions.items():
-        valid_to_select = True
-        st.sidebar.markdown("# " + question.replace('-', ' ').capitalize() + '?')
-
-        # control valid_to_select depending on if question is relevant
-        if question.startswith('spiral-'):
-            has_spiral_answer, has_spiral_mean = current_selection.get('has-spiral-arms', [None, None])
-            # logging.info(f'has_spiral limits: {has_spiral_mean}')
-            if has_spiral_answer == 'yes':
-                valid_to_select = np.min(has_spiral_mean) > 0.5
-            else:
-                valid_to_select = np.min(has_spiral_mean) < 0.5
-
-        if valid_to_select:
-            selected_answer = st.sidebar.selectbox('Answer', answers, format_func=lambda x: x.replace('-',' ').capitalize(), key=question+'_select')
-            selected_mean = st.sidebar.slider(
-                label='Posterior Mean',
-                value=[.0, 1.],
-                key=question+'_mean')
-            current_selection[question] = (selected_answer, selected_mean)
-            # and sort by confidence, for now
-        else:
-            st.sidebar.markdown('*To use this filter, set "Has Spiral Arms = Yes"to > 0.5*'.format(question))
-            current_selection[question] = None, None
-
-    galaxies = df
-    logging.info('Total galaxies: {}'.format(len(galaxies)))
-    valid = np.ones(len(df)).astype(bool)
-    for question, answers in questions.items():
-        answer, mean = current_selection.get(question, [None, None])  # mean is (min, max) limits
-        logging.info(f'Current: {question}, {answer}, {mean}')
-        if mean == None:  # happens when spiral count question not relevant
-            mean = (None, None)
-        if len(mean) == 1:
-            # streamlit sharing bug is giving only the higher value
-            logging.info('Streamlit bug is happening, working')
-            mean = (0., mean[0])
-        # st.markdown('{} {} {} {}'.format(question, answers, answer, mean))
-        if (answer is not None) and (mean is not None):
-            # this_answer = galaxies[question + '_' + answer + '_concentration_mean']
-            # all_answers = galaxies[[question + '_' + a + '_concentration_mean' for a in answers]].sum(axis=1)
-            this_answer = galaxies[question + '_' + answer + '_fraction']
-            all_answers = galaxies[[question + '_' + a + '_fraction' for a in answers]].sum(axis=1)
-            prob = this_answer / all_answers
-            within_limits = (np.min(mean) <= prob) & (prob <= np.max(mean))
-
-            preceding = True
-            if mean != (0., 1.):
-                preceding = galaxies[question + '_proportion_volunteers_asked'] >= 0.5
-
-            logging.info('Fraction of galaxies within limits: {}'.format(within_limits.mean()))
-            valid = valid & within_limits & preceding
-
-    logging.info('Valid galaxies: {}'.format(valid.sum()))
-    st.markdown('{:,} of {:,} galaxies match your criteria.'.format(valid.sum(), len(valid)))
-
-    # selected = galaxies[valid].sample(np.min([valid.sum(), 16]))
+st.subheader("About this app")
+st.markdown("""
+This app displays data from LIGO, Virgo, and GEO downloaded from
+the Gravitational Wave Open Science Center at https://gw-openscience.org .
 
 
-    # image_locs = [row['file_loc'].replace('/decals/png_native', '/galaxy_zoo/gz2') for _, row in selected.iterrows()]
-    # images = [np.array(Image.open(loc)).astype(np.uint8) for loc in image_locs]
+You can see how this works in the [Quickview Jupyter Notebook](https://github.com/losc-tutorial/quickview) or 
+[see the code](https://github.com/jkanner/streamlit-dataview).
 
-    # if show_posteriors is not 'none':
-    #     selected = galaxies[valid][:8]
-    #     question = show_posteriors
-    #     if question == 'spiral-count' or question == 'spiral-winding':
-    #         st.markdown('Sorry! You asked to see posteriors for "{}", but this demo app only supports visualing posteriors for questions with two answers. Please choose another option.'.format(question.capitalize().replace('-', ' ')))
-    #     else:
-    #         answers = questions[question]
-    #         selected_answer = current_selection[question][0]
-    #         for _, galaxy in selected.iterrows():
-    #             show_predictions(galaxy, question, answers, selected_answer)
-    # else:
-    # image_urls = ["https://panoptes-uploads.zooniverse.org/production/subject_location/02a32231-11c6-45b6-b448-fd85ec32fbd8.png"] * 16
-    selected = galaxies[valid][:40]
-    image_urls = selected['url']
-
-    opening_html = '<div style=display:flex;flex-wrap:wrap>'
-    closing_html = '</div>'
-    child_html = ['<img src="{}" style=margin:3px;width:200px;></img>'.format(url) for url in image_urls]
-
-    gallery_html = opening_html
-    for child in child_html:
-        gallery_html += child
-    gallery_html += closing_html
-
-    # st.markdown(gallery_html)
-    st.markdown(gallery_html, unsafe_allow_html=True)
-    # st.markdown('<img src="{}"></img>'.format(child_html), unsafe_allow_html=True)
-    # for image in images:
-    #     st.image(image, width=250)
-
-
-
-    
-
-# def show_predictions(galaxy, question, answers, answer): 
-
-#     answer_index = answers.index(answer) 
-#     # st.markdown(answer_index)
-
-#     fig, (ax0, ax1) = plt.subplots(nrows=1, ncols=2, figsize=(10, 3 * 1))
-
-#     total_votes = np.array(galaxy[question + '_total-votes']).astype(np.float32)  # TODO
-#     votes = np.linspace(0., total_votes)
-#     x = np.stack([votes, total_votes-votes], axis=-1)  # also need the counts for other answer, no
-#     votes_this_answer = x[:, answer_index]
-
-#     cycler = mpl.rcParams['axes.prop_cycle']
-#     # https://matplotlib.org/cycler/
-#     colors = [c['color'] for c in cycler]
-
-#     data =  [json.loads(galaxy[question + '_' + a + '_concentration']) for a in answers]
-#     all_samples = np.array(data).transpose(1, 0, 2)
-
-#     ax = ax0
-#     for model_n, samples in enumerate(all_samples):
-#         all_probs = []
-#         color = colors[model_n]
-#         n_samples = samples.shape[1]  # answer, dropout
-#         for d in range(n_samples):
-#             concentrations = tf.constant(samples[:, d].astype(np.float32))  # answer, dropout
-#             probs = tfp.distributions.DirichletMultinomial(total_votes, concentrations).prob(x)
-#             all_probs.append(probs)
-#             ax.plot(votes_this_answer, probs, alpha=.15, color=color)
-#         mean_probs = np.array(all_probs).mean(axis=0)
-#         ax.plot(votes_this_answer, mean_probs, linewidth=2., color=color)
-
-#     volunteer_response = galaxy[question + '_' + answer]
-#     ax.axvline(volunteer_response, color='k', linestyle='--')
-        
-#     ax.set_xlabel(question.capitalize().replace('-', ' ') + ' "' + answer.capitalize().replace('-', ' ') + '" count')
-#     ax.set_ylabel(r'$p$(count)')
-
-#     ax = ax1
-#     # ax.imshow(np.array(Image.open(galaxy['file_loc'].replace('/media/walml/beta/decals/png_native', 'png'))))
-#     ax.imshow(np.array(Image.open(galaxy['file_loc'].replace('/media/walml/beta/decals/png_native', '/media/walml/beta1/galaxy_zoo/gz2'))))
-#     ax.axis('off')
-        
-#     fig.tight_layout()
-#     st.write(fig)
-
-
-st.set_page_config(
-    layout="wide",
-    page_title='GZ DECaLS',
-    page_icon='gz_icon.jpeg'
-)
-
-@st.cache
-def load_data():
-    df_locs = ['decals_{}.csv'.format(n) for n in range(4)]
-    dfs = [pd.read_csv(df_loc) for df_loc in df_locs]
-    return pd.concat(dfs)
-
-
-if __name__ == '__main__':
-
-    logging.basicConfig(level=logging.CRITICAL)
-
-    df = load_data()
-
-    main(df)
-
-
-# https://discuss.streamlit.io/t/values-slider/9434 streamlit sharing has a temp bug that sliders only show the top value
+""")
