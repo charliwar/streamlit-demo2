@@ -1,5 +1,4 @@
-## Gravitational Wave Quickview App
+# CFB Recruiting
+A [web app](https://cfb-recruiting.herokuapp.com/) that plots a chloropleth map for the states most commonly recruited by user-selected teams
 
-This app downloads and displays a few seconds of data from the [Gravitational Wave Open Science Center](https://gw-osc.org).
-
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://share.streamlit.io/jkanner/streamlit-dataview/app.py)
+Created with [Streamlit](https://www.streamlit.io/)
